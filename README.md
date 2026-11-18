@@ -22,6 +22,11 @@ It only reads `window.Fusion`: no network requests, no dependencies, nothing is 
   the content source via `/pf/api/v3/content/fetch/...`, and the Content API by `_id` (needs a token).
 - **Other Fusion keys:** everything else in `window.Fusion`, as a lazy tree.
 
+## Install
+
+Open https://code-store-platform.github.io/arc-devbar/dist/install.html and drag the button to your bookmarks bar.
+Then open any Arc XP page and click the bookmark.
+
 Close with `Esc`, the `×` button, or by clicking the bookmark again.
 The popup lives in its own shadow DOM, so site styles do not leak in.
 
