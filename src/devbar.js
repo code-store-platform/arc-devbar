@@ -207,11 +207,198 @@
         type: node.type || p.type || 'section',
         id: has(p.id) ? p.id : node.id,
         collection: node.collection || p.collection,
-        name: p.name || get(p, 'customFields.name') || get(p, 'displayProperties.name') || null
+        name: p.name || get(p, 'customFields.name') || get(p, 'displayProperties.name') || null,
+        // Only the fields set in PageBuilder are stored here; unset ones fall back to defaultValue.
+        customFields: p.customFields && typeof p.customFields === 'object' ? p.customFields : null
       });
     }
     var kids = node.children;
     if (Array.isArray(kids)) kids.forEach(function (c) { walkTree(c, depth + 1, out); });
+  }
+
+  // ---------- block settings: propTypes via the React fiber ----------
+  // Field labels, descriptions, groups and defaults live only in the block's propTypes
+  // (PropTypes.string.tag({ label, description, group, defaultValue })). Fusion does not expose
+  // them, so we read the component type from the React fiber tree and match by props.id.
+  // Fiber internals are not a public React API: if anything is missing we fall back to raw values.
+
+  var blockMetaCache = null;
+  function blockMeta() {
+    if (blockMetaCache) return blockMetaCache;
+    blockMetaCache = {};
+    try {
+      var app = document.getElementById('fusion-app') || document.body;
+      var start = null;
+      Object.keys(app).forEach(function (k) {
+        if (start) return;
+        if (k.indexOf('__reactContainer$') === 0) start = app[k];
+        else if (k === '_reactRootContainer') start = get(app[k], '_internalRoot.current');
+      });
+      if (start && start.current) start = start.current;
+      var stack = start ? [start] : [];
+      var guard = 0;
+      while (stack.length && guard++ < 200000) {
+        var f = stack.pop();
+        if (!f) continue;
+        var t = f.type;
+        var id = f.memoizedProps && f.memoizedProps.id;
+        var args = t && typeof t !== 'string' && get(t, 'propTypes.customFields.args');
+        if (has(id)) blockMetaCache['mounted:' + id] = true;
+        // HOC wrappers repeat the same id; the outermost one with propTypes wins.
+        if (has(id) && args && typeof args === 'object' && !blockMetaCache[id]) {
+          blockMetaCache[id] = { label: t.label || null, fields: args };
+          // Same block type elsewhere on the page: used for instances that are not mounted (e.g. conditional ads).
+          var bt = f.memoizedProps.type;
+          if (has(bt) && !blockMetaCache['type:' + bt]) blockMetaCache['type:' + bt] = blockMetaCache[id];
+        }
+        if (f.sibling) stack.push(f.sibling);
+        if (f.child) stack.push(f.child);
+      }
+    } catch (e) { /* fall back to raw customFields */ }
+    return blockMetaCache;
+  }
+
+  // PageBuilder bookkeeping stored next to custom fields (e.g. pbInternal_cloneId): not a block setting.
+  var PB_INTERNAL = /^pbInternal/;
+  var SECRET_KEY = /(passw|secret|token|api[-_]?key|apikey|credential|private[-_]?key|auth[-_]?key)/i;
+  var EMAIL = /[^\s@"'<>]+@[^\s@"'<>]+\.[a-z]{2,}/i;
+  // Never show values of secret-looking fields or anything that looks like an e-mail address.
+  function masked(key, value) {
+    if (value === undefined || value === null || value === '') return null;
+    if (SECRET_KEY.test(key)) return '[hidden: secret-like field name]';
+    if (EMAIL.test(typeof value === 'string' ? value : safeStringify(value))) return '[hidden: contains an e-mail]';
+    return null;
+  }
+  function maskAll(obj) {
+    var out = {};
+    Object.keys(obj || {}).forEach(function (k) {
+      var m = masked(k, obj[k]);
+      out[k] = m === null ? obj[k] : m;
+    });
+    return out;
+  }
+
+  function shortVal(v, max) {
+    max = max || 140;
+    var s = typeof v === 'string' ? (v === '' ? '""' : v) : safeStringify(v);
+    if (s === undefined) s = String(v);
+    return s.length > max ? s.slice(0, max) + '… (' + s.length + ' chars)' : s;
+  }
+
+  function contentFetchUrl(source, query) {
+    var d = get(F, 'deployment');
+    var site = get(F, 'arcSite');
+    return loc.origin + ((F && F.contextPath) || '/pf') + '/api/v3/content/fetch/' + encodeURIComponent(source) +
+      '?query=' + encodeURIComponent(safeStringify(query || {})) +
+      (has(d) ? '&d=' + encodeURIComponent(d) : '') +
+      (has(site) ? '&_website=' + encodeURIComponent(site) : '');
+  }
+
+  // Settings panel for one feature node: one table row per field, grouped by tags.group.
+  function renderSettings(n) {
+    var all = blockMeta();
+    var meta = all[n.id] || all['type:' + n.type];
+    var byType = meta && !all[n.id];
+    var set = n.customFields || {};
+    var box = el('div', { class: 'set' });
+    var rows = [];
+
+    if (meta) {
+      Object.keys(meta.fields).forEach(function (k) {
+        var pt = meta.fields[k] || {};
+        var tags = pt.tags || {};
+        var isSet = Object.prototype.hasOwnProperty.call(set, k);
+        if (tags.hidden && !isSet) return;
+        var def = has(tags.defaultValue) ? tags.defaultValue : tags['default'];
+        rows.push({
+          key: k, label: tags.label || tags.name || k, description: tags.description, group: tags.group,
+          type: pt.type, labels: tags.labels, hidden: !!tags.hidden,
+          isSet: isSet, value: isSet ? set[k] : def, def: def,
+          changed: isSet && !sameVal(set[k], def)
+        });
+      });
+      // Values stored in PB for fields the block no longer declares.
+      Object.keys(set).forEach(function (k) {
+        if (meta.fields[k] || PB_INTERNAL.test(k)) return;
+        rows.push({ key: k, label: k, description: 'not declared in the block propTypes (stale value?)', isSet: true, changed: true, value: set[k] });
+      });
+    } else {
+      Object.keys(set).forEach(function (k) {
+        if (!PB_INTERNAL.test(k)) rows.push({ key: k, label: k, isSet: true, changed: true, value: set[k] });
+      });
+    }
+
+    var changedCount = rows.filter(function (r) { return r.changed; }).length;
+    var copyBtn = el('button', { class: 'b', text: 'Copy JSON' });
+    copyBtn.addEventListener('click', function () {
+      copyText(safeStringify({ id: n.id, type: n.type, name: n.name, label: meta ? meta.label : null, customFields: maskAll(set) }, 2), copyBtn);
+    });
+    box.appendChild(el('div', { class: 'seth' }, [
+      el('span', null, [
+        el('b', { text: (meta && meta.label) || n.type }),
+        has(n.name) ? el('span', { class: 'muted', text: '  ·  "' + n.name + '"' }) : null,
+        el('span', { class: 'muted', text: '  ·  #' + n.id })
+      ]),
+      el('span', { class: 'sp' }),
+      copyBtn
+    ]));
+    var note = '';
+    if (byType) note = ' - block not mounted, labels taken from another ' + n.type + ' on the page';
+    else if (!meta && all['mounted:' + n.id]) note = rows.length ? ' - block declares no custom fields, raw values' : ' - block declares no custom fields';
+    else if (!meta) note = ' - labels unavailable (block not found in React tree), raw customFields';
+    box.appendChild(el('div', { class: 'muted', text: changedCount + ' changed in PB, ' + rows.length + ' fields' + note }));
+    if (!rows.length) return box;
+
+    // Group order = first appearance in propTypes.
+    var groups = [];
+    var byGroup = {};
+    rows.forEach(function (r) {
+      var g = has(r.group) ? r.group : '';
+      if (!byGroup[g]) { byGroup[g] = []; groups.push(g); }
+      byGroup[g].push(r);
+    });
+    var t = el('table', { class: 'st' });
+    groups.forEach(function (g) {
+      var anyChanged = byGroup[g].some(function (r) { return r.changed; });
+      if (g || groups.length > 1) t.appendChild(el('tr', { class: 'grp' + (anyChanged ? '' : ' unch') }, [el('td', { colspan: '2', text: g || 'Other' })]));
+      byGroup[g].forEach(function (r) {
+        var valNode;
+        var m = masked(r.key, r.value);
+        if (m !== null) {
+          valNode = el('span', { class: 'muted', text: m });
+        } else if (r.type === 'contentConfig' && r.value && typeof r.value === 'object' && has(r.value.contentService)) {
+          var q = r.value.contentConfigValues || {};
+          valNode = el('div', null, [
+            el('div', null, [el('span', { class: 'muted', text: 'source: ' }), r.value.contentService]),
+            el('div', null, [el('span', { class: 'muted', text: 'query: ' }), shortVal(q)]),
+            el('a', { href: contentFetchUrl(r.value.contentService, q), target: '_blank', rel: 'noopener', text: 'open content source (fetch)' })
+          ]);
+        } else if (r.value === undefined) {
+          valNode = el('span', { class: 'muted', text: '-' });
+        } else {
+          var txt = shortVal(r.value);
+          var lbl = r.labels && typeof r.value !== 'object' ? r.labels[r.value] : null;
+          valNode = el('span', { text: txt + (has(lbl) && lbl !== r.value ? '  (' + lbl + ')' : '') });
+        }
+        var state = r.changed ? 'changed in PB' : r.isSet ? 'set in PB, equals default' : 'default';
+        t.appendChild(el('tr', { class: r.changed ? 'chg' : 'unch' + (r.isSet ? '' : ' def') }, [
+          el('td', { class: 'l', title: r.key + (r.type ? ' : ' + r.type : '') + (r.hidden ? ' (hidden in PB)' : '') }, [
+            r.changed ? el('span', { class: 'dot', title: state }) : null,
+            r.label,
+            r.label !== r.key ? el('div', { class: 'fk', text: r.key }) : null
+          ]),
+          el('td', { class: 'v', title: state }, [valNode, has(r.description) ? el('div', { class: 'desc', text: shortVal(String(r.description), 300) }) : null])
+        ]));
+      });
+    });
+    box.appendChild(t);
+    return box;
+  }
+
+  function sameVal(a, b) {
+    if (a === b) return true;
+    if ((a === undefined || a === '' || a === null) && (b === undefined || b === '' || b === null)) return true;
+    return safeStringify(a) === safeStringify(b);
   }
 
   // ---------- UI ----------
@@ -224,7 +411,7 @@
     ':host{all:initial}',
     '*{box-sizing:border-box}',
     '.panel{font:12px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:#1d2433;background:#fff;',
-    'width:min(460px,calc(100vw - 24px));max-height:calc(100vh - 24px);display:flex;flex-direction:column;',
+    'width:min(520px,calc(100vw - 24px));max-height:calc(100vh - 24px);display:flex;flex-direction:column;',
     'border:1px solid #c9d1e0;border-radius:8px;box-shadow:0 8px 28px rgba(0,0,0,.22);overflow:hidden}',
     '.hd{display:flex;align-items:center;gap:8px;padding:8px 10px;background:#1d2433;color:#fff}',
     '.hd b{font-size:13px;flex:1}',
@@ -265,7 +452,22 @@
     '.pbid{flex:1;font:600 15px ui-monospace,SFMono-Regular,Menlo,monospace;word-break:break-all}',
     '.herolinks{margin-bottom:6px}',
     '.warn{background:#fff4e5;border:1px solid #f9ab00;border-radius:6px;padding:8px;margin-top:6px}',
+    'details.fd>summary{cursor:pointer;list-style:none}details.fd>summary::-webkit-details-marker{display:none}',
+    '.feat.fs:before{content:"▸";display:inline-block;width:11px;color:#8a96ab}details.fd[open]>.feat.fs:before{content:"▾"}',
+    '.feat .sb{color:#1a5fd0;font-family:-apple-system,BlinkMacSystemFont,sans-serif;font-size:10.5px}',
+    '.flt{display:block;margin:4px 0 6px;color:#5b6b85;cursor:pointer}.flt input{vertical-align:-2px;margin:0 4px 0 0}',
+    '.set{margin:4px 0 8px;padding:6px 8px;border:1px solid #e3e8f0;border-radius:6px;background:#f8f9fc}',
+    '.seth{display:flex;align-items:center;gap:6px;margin-bottom:2px}.seth .sp{flex:1}',
+    'table.st{margin-top:4px}table.st td{padding:3px 0;border-top:1px solid #eef1f6}',
+    'table.st td.l{width:150px;white-space:normal;word-break:break-word}',
+    'tr.grp td{font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:#5b6b85;padding-top:7px}',
+    'tr.def td.v,tr.def td.l{color:#8a96ab}tr.chg td.l{color:#1d2433;font-weight:600}',
+    '.dot{display:inline-block;width:6px;height:6px;border-radius:3px;background:#f9ab00;margin-right:5px;vertical-align:1px}',
+    '.fk{font:10.5px ui-monospace,SFMono-Regular,Menlo,monospace;color:#8a96ab;font-weight:400}',
+    '.desc{font-family:-apple-system,BlinkMacSystemFont,sans-serif;font-size:11px;color:#8a96ab;word-break:normal}',
+    '.only-chg tr.unch{display:none}',
     '@media (prefers-color-scheme:dark){',
+    '.set{background:#222834;border-color:#3a4252}table.st td{border-color:#2c3340}tr.chg td.l{color:#e3e8f0}',
     '.panel{background:#1b1f27;color:#e3e8f0;border-color:#3a4252}',
     'section{border-color:#2c3340}td.l,h3{color:#9aa7bd}',
     'button.b{background:#2c3340;color:#e3e8f0;border-color:#3a4252}button.b:hover{background:#3a4252}',
@@ -431,17 +633,34 @@
     })]);
     if (nodes.length) {
       var list = el('div');
+      var onlyChanged = el('input', { type: 'checkbox' });
+      onlyChanged.addEventListener('change', function () {
+        list.className = onlyChanged.checked ? 'only-chg' : '';
+      });
+      featBox.appendChild(el('label', { class: 'flt' }, [onlyChanged, ' Settings: only fields changed in PB']));
       nodes.forEach(function (n) {
         var isF = n.collection === 'features';
-        list.appendChild(el('div', {
+        var rowAttrs = {
           class: 'feat' + (isF ? ' f' : ''),
           title: [n.collection, n.type, n.id].filter(has).join(' / '),
           style: 'padding-left:' + (n.depth * 10) + 'px'
-        }, [
+        };
+        var rowKids = [
           el('span', { class: 't', text: String(n.type || '?') }),
           has(n.id) ? el('span', { class: 'i', text: '  #' + n.id }) : null,
           has(n.name) ? el('span', { class: 'i', text: '  "' + n.name + '"' }) : null
-        ]));
+        ];
+        if (!isF || !has(n.id)) {
+          list.appendChild(el('div', rowAttrs, rowKids));
+          return;
+        }
+        // Features: the row opens the block settings; rendered on first open.
+        rowAttrs.class += ' fs';
+        var d = el('details', { class: 'fd' }, [el('summary', rowAttrs, rowKids.concat([el('span', { class: 'sb', text: '  settings' })]))]);
+        d.addEventListener('toggle', function () {
+          if (d.open && d.children.length === 1) d.appendChild(renderSettings(n));
+        });
+        list.appendChild(d);
       });
       featBox.appendChild(list);
     }
@@ -507,7 +726,9 @@
     body.appendChild(section('Quick links', links));
 
     // --- other Fusion keys ---
-    var known = ['deployment', 'arcSite', 'outputType', 'template', 'layout', 'lastModified', 'contextPath', 'spa', 'globalContent', 'globalContentConfig', 'tree', 'contentCache', 'mxId'];
+    var known = ['deployment', 'arcSite', 'outputType', 'template', 'layout', 'lastModified', 'contextPath', 'spa', 'globalContent', 'globalContentConfig', 'tree', 'contentCache', 'mxId',
+      // environment holds site env vars: only ENVIRONMENT and FUSION_RELEASE are shown (Page section), never the rest.
+      'environment'];
     var other = Object.keys(F).filter(function (k) { return known.indexOf(k) === -1; });
     if (other.length) {
       var otherBox = el('details', { class: 'sec' }, [el('summary', { text: 'Other Fusion keys: ' + other.join(', ') })]);
