@@ -466,6 +466,8 @@
     '.fk{font:10.5px ui-monospace,SFMono-Regular,Menlo,monospace;color:#8a96ab;font-weight:400}',
     '.desc{font-family:-apple-system,BlinkMacSystemFont,sans-serif;font-size:11px;color:#8a96ab;word-break:normal}',
     '.only-chg tr.unch{display:none}',
+    '.mres{color:#8a96ab}.mres.miss{color:#c97b76}',
+    '.mtag{margin-left:6px;font:10px -apple-system,BlinkMacSystemFont,sans-serif;padding:0 5px;border:1px solid #c9d1e0;border-radius:8px;color:#8a96ab;white-space:nowrap}',
     '@media (prefers-color-scheme:dark){',
     '.set{background:#222834;border-color:#3a4252}table.st td{border-color:#2c3340}tr.chg td.l{color:#e3e8f0}',
     '.panel{background:#1b1f27;color:#e3e8f0;border-color:#3a4252}',
@@ -561,6 +563,33 @@
       ['contextPath', F.contextPath],
       ['spa', has(F.spa) ? String(F.spa) : null]
     ])])));
+
+    // --- metadata (PageBuilder Metadata tab, raw from Fusion.metas) ---
+    // {{content.X.Y}} tokens are resolved by Fusion against globalContent; shown next to the raw value.
+    var metas = F.metas && typeof F.metas === 'object' ? F.metas : {};
+    var metaKeys = Object.keys(metas);
+    if (metaKeys.length) {
+      var metaRows = metaKeys.map(function (k) {
+        var m = metas[k] && typeof metas[k] === 'object' ? metas[k] : { value: metas[k] };
+        var raw = String(m.value);
+        var missing = false;
+        var hasToken = false;
+        var resolved = raw.replace(/\{\{\s*content\.([^}\s]+)\s*\}\}/g, function (t, p) {
+          hasToken = true;
+          var v = get(gc, p);
+          if (v === undefined || v === null) { missing = true; return String(v); }
+          return typeof v === 'object' ? safeStringify(v) : String(v);
+        });
+        return [k, el('span', null, [
+          raw,
+          hasToken ? el('span', { class: missing ? 'mres miss' : 'mres', text: ' - ' + resolved }) : null,
+          m.html === false ? el('span', { class: 'mtag', text: 'not in head' }) : null
+        ])];
+      });
+      body.appendChild(section('Metadata', kvTable(metaRows)));
+    } else {
+      body.appendChild(section('Metadata', el('div', { class: 'muted', text: 'none set in PageBuilder' })));
+    }
 
     // --- resolver ---
     // The resolver name is not exposed anywhere public (Fusion, HTML, response headers); Arc shows it
